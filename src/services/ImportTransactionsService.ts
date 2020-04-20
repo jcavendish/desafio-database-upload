@@ -1,12 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import csv from 'csv-parser';
-import { Transform } from 'stream';
+import csv from 'csv-parse';
 
+import { getRepository, In, getCustomRepository } from 'typeorm';
 import Transaction from '../models/Transaction';
 import AppError from '../errors/AppError';
 import uploadConfig from '../config/upload';
-import CreateTransactionService from './CreateTransactionService';
+import Category from '../models/Category';
+import TransactionsRepository from '../repositories/TransactionsRepository';
 
 interface Request {
   filename: string;
@@ -26,57 +27,103 @@ class ImportTransactionsService {
       throw new AppError('The file must be a CSV');
     }
     const file = path.join(uploadConfig.directory, filename);
-    const transactions = await this.createTransactionsFromFile(file);
+
+    const parses = csv({
+      from_line: 2,
+    });
+
+    const readStream = fs.createReadStream(file);
+
+    const parseCSV = readStream.pipe(parses);
+
+    const categoriesCsv: string[] = [];
+    const transactionsCsv: TransactionFile[] = [];
+
+    parseCSV.on('data', async line => {
+      const [title, type, value, category] = line.map((cell: string) =>
+        cell.trim(),
+      );
+
+      if (!title || !type || !value) return;
+
+      categoriesCsv.push(category);
+      transactionsCsv.push({ title, type, value, category });
+    });
+
+    await new Promise(resolve => parseCSV.on('end', resolve));
+
+    const categories = await this.handleCategories(categoriesCsv);
+    const transactions = await this.handleTransactions(
+      transactionsCsv,
+      categories,
+    );
 
     await this.deleteFileFromDisk(file);
 
     return transactions;
   }
 
-  private async createTransactionsFromFile(
-    file: string,
+  private async handleTransactions(
+    transactionsCsv: TransactionFile[],
+    categories: Category[],
   ): Promise<Transaction[]> {
-    const createTransaction = new CreateTransactionService();
+    const transactionsRepository = getCustomRepository(TransactionsRepository);
 
-    function saveInDB(transactions: Transaction[]): Transform {
-      return new Transform({
-        readableObjectMode: true,
-        writableObjectMode: true,
-        transform(chunk, encoding, callback): void {
-          const { title, type, value, category } = chunk as TransactionFile;
-          createTransaction
-            .execute({
-              title,
-              type,
-              value: Number(value),
-              category,
-            })
-            .then(transaction => {
-              transactions.push(transaction);
-              callback(null, transaction);
-            });
-        },
-      });
-    }
+    const transactions = transactionsRepository.create(
+      transactionsCsv.map(({ title, type, value, category }) => ({
+        title,
+        type,
+        value: Number(value),
+        category_id: categories.find(
+          ({ title: categoryTitle }) => categoryTitle === category,
+        )?.id,
+      })),
+    );
 
-    async function createRecords(): Promise<Transaction[]> {
-      const transactions: Transaction[] = [];
-      return new Promise(resolve => {
-        fs.createReadStream(file)
-          .pipe(
-            csv({
-              mapValues: ({ value }) => value.trim(),
-              mapHeaders: ({ header }) => header.trim(),
-            }),
-          )
-          .pipe(saveInDB(transactions))
-          .on('finish', () => {
-            resolve(transactions);
-          });
-      });
-    }
-    const transactions = await createRecords();
+    await transactionsRepository.save(transactions);
+
     return transactions;
+  }
+
+  private async handleCategories(categoriesCsv: string[]): Promise<Category[]> {
+    const categoriesRepository = getRepository(Category);
+    const existentCategories = await categoriesRepository.find({
+      where: {
+        title: In(categoriesCsv),
+      },
+    });
+
+    const existentCategoryTitles = existentCategories.map(
+      category => category.title,
+    );
+
+    const categoriesToAdd = this.getCategoriesToAdd(
+      categoriesCsv,
+      existentCategoryTitles,
+    );
+
+    const addedCategories = categoriesRepository.create(
+      categoriesToAdd.map(title => ({
+        title,
+      })),
+    );
+    await categoriesRepository.save(addedCategories);
+
+    return [...addedCategories, ...existentCategories];
+  }
+
+  private getCategoriesToAdd(
+    categories: string[],
+    existentCategories: string[],
+  ): string[] {
+    const lookup = new Set<string>();
+    categories.forEach(category => {
+      lookup.add(category);
+    });
+    existentCategories.forEach(category => {
+      lookup.delete(category);
+    });
+    return Array.from(lookup);
   }
 
   private async deleteFileFromDisk(file: string): Promise<void> {
