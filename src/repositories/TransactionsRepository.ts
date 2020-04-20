@@ -15,11 +15,11 @@ class TransactionsRepository extends Repository<Transaction> {
     const balance = transactions.reduce(
       (acc: Balance, curr) => {
         if (curr.type === 'income') {
-          acc.income += curr.value;
-          acc.total += curr.value;
+          acc.income += Number(curr.value);
+          acc.total += Number(curr.value);
         } else {
-          acc.outcome += curr.value;
-          acc.total -= curr.value;
+          acc.outcome += Number(curr.value);
+          acc.total -= Number(curr.value);
         }
         return acc;
       },
